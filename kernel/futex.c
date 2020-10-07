@@ -679,6 +679,188 @@ out:
 	return err;
 }
 
+static int
+get_futex_key_gem5_instrumented(u32 __user *uaddr, int fshared, union futex_key *key, enum futex_access rw)
+{
+	unsigned long address = (unsigned long)uaddr;
+	struct mm_struct *mm = current->mm;
+	struct page *page, *tail;
+	struct address_space *mapping;
+	int err, ro = 0;
+
+    m5_dump_stats(0, 0);
+	/*
+	 * The futex address must be "naturally" aligned.
+	 */
+	key->both.offset = address % PAGE_SIZE;
+	if (unlikely((address % sizeof(u32)) != 0))
+		return -EINVAL;
+	address -= key->both.offset;
+    m5_dump_stats(0, 0);
+
+	if (unlikely(!access_ok(uaddr, sizeof(u32))))
+		return -EFAULT;
+    m5_dump_stats(0, 0);
+
+	if (unlikely(should_fail_futex(fshared)))
+		return -EFAULT;
+    m5_dump_stats(0, 0);
+
+	/*
+	 * PROCESS_PRIVATE futexes are fast.
+	 * As the mm cannot disappear under us and the 'key' only needs
+	 * virtual address, we dont even have to find the underlying vma.
+	 * Note : We do have to check 'uaddr' is a valid user address,
+	 *        but access_ok() should be faster than find_vma()
+	 */
+	if (!fshared) {
+		key->private.mm = mm;
+		key->private.address = address;
+        m5_dump_stats(0, 0);
+		return 0;
+	}
+
+again:
+	/* Ignore any VERIFY_READ mapping (futex common case) */
+	if (unlikely(should_fail_futex(fshared)))
+		return -EFAULT;
+
+	err = get_user_pages_fast(address, 1, FOLL_WRITE, &page);
+	/*
+	 * If write access is not required (eg. FUTEX_WAIT), try
+	 * and get read-only access.
+	 */
+	if (err == -EFAULT && rw == FUTEX_READ) {
+		err = get_user_pages_fast(address, 1, 0, &page);
+		ro = 1;
+	}
+	if (err < 0)
+		return err;
+	else
+		err = 0;
+
+	/*
+	 * The treatment of mapping from this point on is critical. The page
+	 * lock protects many things but in this context the page lock
+	 * stabilizes mapping, prevents inode freeing in the shared
+	 * file-backed region case and guards against movement to swap cache.
+	 *
+	 * Strictly speaking the page lock is not needed in all cases being
+	 * considered here and page lock forces unnecessarily serialization
+	 * From this point on, mapping will be re-verified if necessary and
+	 * page lock will be acquired only if it is unavoidable
+	 *
+	 * Mapping checks require the head page for any compound page so the
+	 * head page and mapping is looked up now. For anonymous pages, it
+	 * does not matter if the page splits in the future as the key is
+	 * based on the address. For filesystem-backed pages, the tail is
+	 * required as the index of the page determines the key. For
+	 * base pages, there is no tail page and tail == page.
+	 */
+	tail = page;
+	page = compound_head(page);
+	mapping = READ_ONCE(page->mapping);
+
+	/*
+	 * If page->mapping is NULL, then it cannot be a PageAnon
+	 * page; but it might be the ZERO_PAGE or in the gate area or
+	 * in a special mapping (all cases which we are happy to fail);
+	 * or it may have been a good file page when get_user_pages_fast
+	 * found it, but truncated or holepunched or subjected to
+	 * invalidate_complete_page2 before we got the page lock (also
+	 * cases which we are happy to fail).  And we hold a reference,
+	 * so refcount care in invalidate_complete_page's remove_mapping
+	 * prevents drop_caches from setting mapping to NULL beneath us.
+	 *
+	 * The case we do have to guard against is when memory pressure made
+	 * shmem_writepage move it from filecache to swapcache beneath us:
+	 * an unlikely race, but we do need to retry for page->mapping.
+	 */
+	if (unlikely(!mapping)) {
+		int shmem_swizzled;
+
+		/*
+		 * Page lock is required to identify which special case above
+		 * applies. If this is really a shmem page then the page lock
+		 * will prevent unexpected transitions.
+		 */
+		lock_page(page);
+		shmem_swizzled = PageSwapCache(page) || page->mapping;
+		unlock_page(page);
+		put_page(page);
+
+		if (shmem_swizzled)
+			goto again;
+
+		return -EFAULT;
+	}
+
+	/*
+	 * Private mappings are handled in a simple way.
+	 *
+	 * If the futex key is stored on an anonymous page, then the associated
+	 * object is the mm which is implicitly pinned by the calling process.
+	 *
+	 * NOTE: When userspace waits on a MAP_SHARED mapping, even if
+	 * it's a read-only handle, it's expected that futexes attach to
+	 * the object not the particular process.
+	 */
+	if (PageAnon(page)) {
+		/*
+		 * A RO anonymous page will never change and thus doesn't make
+		 * sense for futex operations.
+		 */
+		if (unlikely(should_fail_futex(fshared)) || ro) {
+			err = -EFAULT;
+			goto out;
+		}
+
+		key->both.offset |= FUT_OFF_MMSHARED; /* ref taken on mm */
+		key->private.mm = mm;
+		key->private.address = address;
+
+	} else {
+		struct inode *inode;
+
+		/*
+		 * The associated futex object in this case is the inode and
+		 * the page->mapping must be traversed. Ordinarily this should
+		 * be stabilised under page lock but it's not strictly
+		 * necessary in this case as we just want to pin the inode, not
+		 * update the radix tree or anything like that.
+		 *
+		 * The RCU read lock is taken as the inode is finally freed
+		 * under RCU. If the mapping still matches expectations then the
+		 * mapping->host can be safely accessed as being a valid inode.
+		 */
+		rcu_read_lock();
+
+		if (READ_ONCE(page->mapping) != mapping) {
+			rcu_read_unlock();
+			put_page(page);
+
+			goto again;
+		}
+
+		inode = READ_ONCE(mapping->host);
+		if (!inode) {
+			rcu_read_unlock();
+			put_page(page);
+
+			goto again;
+		}
+
+		key->both.offset |= FUT_OFF_INODE; /* inode-based key */
+		key->shared.i_seq = get_inode_sequence_number(inode);
+		key->shared.pgoff = basepage_index(tail);
+		rcu_read_unlock();
+	}
+
+out:
+	put_page(page);
+	return err;
+}
+
 static inline void put_futex_key(union futex_key *key)
 {
 }
@@ -2251,6 +2433,33 @@ static inline struct futex_hash_bucket *queue_lock(struct futex_q *q)
 	return hb;
 }
 
+static inline struct futex_hash_bucket *queue_lock_gem5_instrumented(struct futex_q *q)
+	__acquires(&hb->lock)
+{
+	struct futex_hash_bucket *hb;
+
+    m5_dump_stats(0, 0);
+	hb = hash_futex(&q->key);
+    m5_dump_stats(0, 0);
+
+	/*
+	 * Increment the counter before taking the lock so that
+	 * a potential waker won't miss a to-be-slept task that is
+	 * waiting for the spinlock. This is safe as all queue_lock()
+	 * users end up calling queue_me(). Similarly, for housekeeping,
+	 * decrement the counter at queue_unlock() when some error has
+	 * occurred and we don't end up adding the task to the list.
+	 */
+	hb_waiters_inc(hb); /* implies smp_mb(); (A) */
+    m5_dump_stats(0, 0);
+
+	q->lock_ptr = &hb->lock;
+
+	spin_lock(&hb->lock);
+    m5_dump_stats(0, 0);
+	return hb;
+}
+
 static inline void
 queue_unlock(struct futex_hash_bucket *hb)
 	__releases(&hb->lock)
@@ -2638,6 +2847,42 @@ static void futex_wait_queue_me(struct futex_hash_bucket *hb, struct futex_q *q,
 	__set_current_state(TASK_RUNNING);
 }
 
+static void futex_wait_queue_me_gem5_instrumented(struct futex_hash_bucket *hb, struct futex_q *q,
+				struct hrtimer_sleeper *timeout)
+{
+	/*
+	 * The task state is guaranteed to be set before another task can
+	 * wake it. set_current_state() is implemented using smp_store_mb() and
+	 * queue_me() calls spin_unlock() upon completion, both serializing
+	 * access to the hash list and forcing another memory barrier.
+	 */
+    m5_dump_stats(0, 0);
+	set_current_state(TASK_INTERRUPTIBLE);
+    m5_dump_stats(0, 0);
+	queue_me(q, hb);
+    m5_dump_stats(0, 0);
+
+	/* Arm the timer */
+	if (timeout)
+		hrtimer_sleeper_start_expires(timeout, HRTIMER_MODE_ABS);
+    m5_dump_stats(0, 0);
+
+	/*
+	 * If we have been removed from the hash list, then another task
+	 * has tried to wake us, and we can skip the call to schedule().
+	 */
+	if (likely(!plist_node_empty(&q->list))) {
+		/*
+		 * If the timer has already expired, current will already be
+		 * flagged for rescheduling. Only call schedule if there
+		 * is no timeout, or if it has yet to expire.
+		 */
+		if (!timeout || timeout->task)
+			freezable_schedule();
+	}
+	__set_current_state(TASK_RUNNING);
+}
+
 /**
  * futex_wait_setup() - Prepare to wait on a futex
  * @uaddr:	the futex userspace address
@@ -2711,6 +2956,68 @@ retry_private:
 out:
 	if (ret)
 		put_futex_key(&q->key);
+	return ret;
+}
+
+static int futex_wait_setup_gem5_instrumented(u32 __user *uaddr, u32 val, unsigned int flags,
+			   struct futex_q *q, struct futex_hash_bucket **hb)
+{
+	u32 uval;
+	int ret;
+
+	/*
+	 * Access the page AFTER the hash-bucket is locked.
+	 * Order is important:
+	 *
+	 *   Userspace waiter: val = var; if (cond(val)) futex_wait(&var, val);
+	 *   Userspace waker:  if (cond(var)) { var = new; futex_wake(&var); }
+	 *
+	 * The basic logical guarantee of a futex is that it blocks ONLY
+	 * if cond(var) is known to be true at the time of blocking, for
+	 * any cond.  If we locked the hash-bucket after testing *uaddr, that
+	 * would open a race condition where we could block indefinitely with
+	 * cond(var) false, which would violate the guarantee.
+	 *
+	 * On the other hand, we insert q and release the hash-bucket only
+	 * after testing *uaddr.  This guarantees that futex_wait() will NOT
+	 * absorb a wakeup if *uaddr does not match the desired values
+	 * while the syscall executes.
+	 */
+retry:
+	ret = get_futex_key_gem5_instrumented(uaddr, flags & FLAGS_SHARED, &q->key, FUTEX_READ);
+	if (unlikely(ret != 0))
+		return ret;
+
+retry_private:
+	*hb = queue_lock_gem5_instrumented(q);
+
+    m5_dump_stats(0, 0);
+	ret = get_futex_value_locked(&uval, uaddr);
+    m5_dump_stats(0, 0);
+
+	if (ret) {
+		queue_unlock(*hb);
+
+		ret = get_user(uval, uaddr);
+		if (ret)
+			goto out;
+
+		if (!(flags & FLAGS_SHARED))
+			goto retry_private;
+
+		put_futex_key(&q->key);
+		goto retry;
+	}
+
+	if (uval != val) {
+		queue_unlock(*hb);
+		ret = -EWOULDBLOCK;
+	}
+
+out:
+	if (ret)
+		put_futex_key(&q->key);
+    m5_dump_stats(0, 0);
 	return ret;
 }
 
@@ -2788,23 +3095,28 @@ static int futex_wait_gem5_instrumented(u32 __user *uaddr, unsigned int flags, u
 	struct futex_q q = futex_q_init;
 	int ret;
 
+    // reset stats at the beginning of the function call
+    m5_reset_stats(0, 0);
+
 	if (!bitset)
 		return -EINVAL;
 	q.bitset = bitset;
+    m5_dump_stats(0, 0);
 
 	to = futex_setup_timer(abs_time, &timeout, flags,
 			       current->timer_slack_ns);
+    m5_dump_stats(0, 0);
 retry:
 	/*
 	 * Prepare to wait on uaddr. On success, holds hb lock and increments
 	 * q.key refs.
 	 */
-	ret = futex_wait_setup(uaddr, val, flags, &q, &hb);
+	ret = futex_wait_setup_gem5_instrumented(uaddr, val, flags, &q, &hb);
 	if (ret)
 		goto out;
 
 	/* queue_me and wait for wakeup, timeout, or a signal. */
-	futex_wait_queue_me(hb, &q, to);
+	futex_wait_queue_me_gem5_instrumented(hb, &q, to);
 
 	/* If we were woken (and unqueued), we succeeded, whatever. */
 	ret = 0;
