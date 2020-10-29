@@ -63,6 +63,8 @@
 
 #include "locking/rtmutex_common.h"
 
+#define TEST_LOADED_HASH_QUEUE
+
 /*
  * READ this before attempting to hack on futexes!
  *
@@ -381,6 +383,13 @@ static struct futex_hash_bucket *hash_futex(union futex_key *key)
 {
 	u32 hash = jhash2((u32 *)key, offsetof(typeof(*key), both.offset) / 4,
 			  key->both.offset);
+
+	return &futex_queues[hash & (futex_hashsize - 1)];
+}
+
+static struct futex_hash_bucket *hash_futex_to_same_bucket(union futex_key *key)
+{
+    u32 hash = 0xfeedface;
 
 	return &futex_queues[hash & (futex_hashsize - 1)];
 }
@@ -1830,6 +1839,59 @@ out:
 	return ret;
 }
 
+static int
+futex_wake_gem5_instrumented(u32 __user *uaddr, unsigned int flags, int nr_wake, u32 bitset)
+{
+	struct futex_hash_bucket *hb;
+	struct futex_q *this, *next;
+	union futex_key key = FUTEX_KEY_INIT;
+	int ret;
+	DEFINE_WAKE_Q(wake_q);
+
+	if (!bitset)
+		return -EINVAL;
+
+	ret = get_futex_key(uaddr, flags & FLAGS_SHARED, &key, FUTEX_READ);
+	if (unlikely(ret != 0))
+		goto out;
+
+#ifdef TEST_LOADED_HASH_QUEUE
+	hb = hash_futex_to_same_bucket(&key);
+#else
+	hb = hash_futex(&key);
+#endif
+
+	/* Make sure we really have tasks to wakeup */
+	if (!hb_waiters_pending(hb))
+		goto out_put_key;
+
+	spin_lock(&hb->lock);
+
+	plist_for_each_entry_safe(this, next, &hb->chain, list) {
+		if (match_futex (&this->key, &key)) {
+			if (this->pi_state || this->rt_waiter) {
+				ret = -EINVAL;
+				break;
+			}
+
+			/* Check if one of the bits is set in both bitsets */
+			if (!(this->bitset & bitset))
+				continue;
+
+			mark_wake_futex(&wake_q, this);
+			if (++ret >= nr_wake)
+				break;
+		}
+	}
+
+	spin_unlock(&hb->lock);
+	wake_up_q(&wake_q);
+out_put_key:
+	put_futex_key(&key);
+out:
+	return ret;
+}
+
 static int futex_atomic_op_inuser(unsigned int encoded_op, u32 __user *uaddr)
 {
 	unsigned int op =	  (encoded_op & 0x70000000) >> 28;
@@ -2439,7 +2501,11 @@ static inline struct futex_hash_bucket *queue_lock_gem5_instrumented(struct fute
 	struct futex_hash_bucket *hb;
 
     m5_dump_stats(0, 0);
+#ifdef TEST_LOADED_HASH_QUEUE
+	hb = hash_futex_to_same_bucket(&q->key);
+#else
 	hb = hash_futex(&q->key);
+#endif
     m5_dump_stats(0, 0);
 
 	/*
@@ -4192,7 +4258,7 @@ long do_futex(u32 __user *uaddr, int op, u32 val, ktime_t *timeout,
             val3 = FUTEX_BITSET_MATCH_ANY;
             /* fall through */
         case FUTEX_WAKE_BITSET:
-            return futex_wake(uaddr, flags, val, val3);
+            return futex_wake_gem5_instrumented(uaddr, flags, val, val3);
         case FUTEX_REQUEUE:
             return futex_requeue(uaddr, flags, uaddr2, val, val2, NULL, 0);
         case FUTEX_CMP_REQUEUE:

@@ -47,8 +47,27 @@ void m5_exit(u64 ns_delay);
 void m5_fail(u64 ns_delay, u64 code);
 u64  m5_init_param(u64 key_str1, u64 key_str2);
 void m5_checkpoint(u64 ns_delay, u64 ns_period);
-void m5_reset_stats(u64 ns_delay, u64 ns_period);
-void m5_dump_stats(u64 ns_delay, u64 ns_period);
+
+__attribute__((always_inline))
+inline void m5_reset_stats(u64 ns_delay, u64 ns_period) {
+    __asm__ __volatile__(".byte 0x0F, 0x04\n\t"
+                         ".word 0x40\n\t"
+                         :
+                         : "D"(ns_delay), "S"(ns_period)
+                         :
+                         );
+}
+
+__attribute__((always_inline))
+inline void m5_dump_stats(u64 ns_delay, u64 ns_period) {
+    __asm__ __volatile__(".byte 0x0F, 0x04\n\t"
+                         ".word 0x41\n\t"
+                         :
+                         : "D"(ns_delay), "S"(ns_period)
+                         :
+                         );
+}
+
 void m5_dump_reset_stats(u64 ns_delay, u64 ns_period);
 u64  m5_read_file(void* buffer, u64 len, u64 offset);
 u64  m5_write_file(void* buffer, u64 len, u64 offset, const char* filename);
