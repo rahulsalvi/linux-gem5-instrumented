@@ -64,6 +64,8 @@
 #include "locking/rtmutex_common.h"
 
 #define TEST_LOADED_HASH_QUEUE
+#define INSTRUMENT_FUTEX_WAIT
+/* #define INSTRUMENT_FUTEX_WAKE */
 
 /*
  * READ this before attempting to hack on futexes!
@@ -1848,12 +1850,24 @@ futex_wake_gem5_instrumented(u32 __user *uaddr, unsigned int flags, int nr_wake,
 	int ret;
 	DEFINE_WAKE_Q(wake_q);
 
+#ifdef INSTRUMENT_FUTEX_WAKE
+    m5_reset_stats(0, 0);
+#endif
+
 	if (!bitset)
 		return -EINVAL;
 
-	ret = get_futex_key(uaddr, flags & FLAGS_SHARED, &key, FUTEX_READ);
+#ifdef INSTRUMENT_FUTEX_WAKE
+    m5_dump_stats(0, 0);
+#endif
+
+	ret = get_futex_key_gem5_instrumented(uaddr, flags & FLAGS_SHARED, &key, FUTEX_READ);
 	if (unlikely(ret != 0))
 		goto out;
+
+#ifdef INSTRUMENT_FUTEX_WAKE
+    m5_dump_stats(0, 0);
+#endif
 
 #ifdef TEST_LOADED_HASH_QUEUE
 	hb = hash_futex_to_same_bucket(&key);
@@ -1861,11 +1875,23 @@ futex_wake_gem5_instrumented(u32 __user *uaddr, unsigned int flags, int nr_wake,
 	hb = hash_futex(&key);
 #endif
 
+#ifdef INSTRUMENT_FUTEX_WAKE
+    m5_dump_stats(0, 0);
+#endif
+
 	/* Make sure we really have tasks to wakeup */
 	if (!hb_waiters_pending(hb))
 		goto out_put_key;
 
+#ifdef INSTRUMENT_FUTEX_WAKE
+    m5_dump_stats(0, 0);
+#endif
+
 	spin_lock(&hb->lock);
+
+#ifdef INSTRUMENT_FUTEX_WAKE
+    m5_dump_stats(0, 0);
+#endif
 
 	plist_for_each_entry_safe(this, next, &hb->chain, list) {
 		if (match_futex (&this->key, &key)) {
@@ -1884,10 +1910,23 @@ futex_wake_gem5_instrumented(u32 __user *uaddr, unsigned int flags, int nr_wake,
 		}
 	}
 
+#ifdef INSTRUMENT_FUTEX_WAKE
+    m5_dump_stats(0, 0);
+#endif
+
 	spin_unlock(&hb->lock);
+#ifdef INSTRUMENT_FUTEX_WAKE
+    m5_dump_stats(0, 0);
+#endif
 	wake_up_q(&wake_q);
+#ifdef INSTRUMENT_FUTEX_WAKE
+    m5_dump_stats(0, 0);
+#endif
 out_put_key:
 	put_futex_key(&key);
+#ifdef INSTRUMENT_FUTEX_WAKE
+    m5_dump_stats(0, 0);
+#endif
 out:
 	return ret;
 }
@@ -2500,13 +2539,17 @@ static inline struct futex_hash_bucket *queue_lock_gem5_instrumented(struct fute
 {
 	struct futex_hash_bucket *hb;
 
+#ifdef INSTRUMENT_FUTEX_WAIT
     m5_dump_stats(0, 0);
+#endif
 #ifdef TEST_LOADED_HASH_QUEUE
 	hb = hash_futex_to_same_bucket(&q->key);
 #else
 	hb = hash_futex(&q->key);
 #endif
+#ifdef INSTRUMENT_FUTEX_WAIT
     m5_dump_stats(0, 0);
+#endif
 
 	/*
 	 * Increment the counter before taking the lock so that
@@ -2517,12 +2560,16 @@ static inline struct futex_hash_bucket *queue_lock_gem5_instrumented(struct fute
 	 * occurred and we don't end up adding the task to the list.
 	 */
 	hb_waiters_inc(hb); /* implies smp_mb(); (A) */
+#ifdef INSTRUMENT_FUTEX_WAIT
     m5_dump_stats(0, 0);
+#endif
 
 	q->lock_ptr = &hb->lock;
 
 	spin_lock(&hb->lock);
+#ifdef INSTRUMENT_FUTEX_WAIT
     m5_dump_stats(0, 0);
+#endif
 	return hb;
 }
 
@@ -2922,16 +2969,25 @@ static void futex_wait_queue_me_gem5_instrumented(struct futex_hash_bucket *hb, 
 	 * queue_me() calls spin_unlock() upon completion, both serializing
 	 * access to the hash list and forcing another memory barrier.
 	 */
+#ifdef INSTRUMENT_FUTEX_WAIT
     m5_dump_stats(0, 0);
+#endif
 	set_current_state(TASK_INTERRUPTIBLE);
+#ifdef INSTRUMENT_FUTEX_WAIT
     m5_dump_stats(0, 0);
+#endif
 	queue_me(q, hb);
+#ifdef INSTRUMENT_FUTEX_WAIT
     m5_dump_stats(0, 0);
+#endif
 
 	/* Arm the timer */
 	if (timeout)
 		hrtimer_sleeper_start_expires(timeout, HRTIMER_MODE_ABS);
+
+#ifdef INSTRUMENT_FUTEX_WAIT
     m5_dump_stats(0, 0);
+#endif
 
 	/*
 	 * If we have been removed from the hash list, then another task
@@ -3057,9 +3113,13 @@ retry:
 retry_private:
 	*hb = queue_lock_gem5_instrumented(q);
 
+#ifdef INSTRUMENT_FUTEX_WAIT
     m5_dump_stats(0, 0);
+#endif
 	ret = get_futex_value_locked(&uval, uaddr);
+#ifdef INSTRUMENT_FUTEX_WAIT
     m5_dump_stats(0, 0);
+#endif
 
 	if (ret) {
 		queue_unlock(*hb);
@@ -3083,7 +3143,9 @@ retry_private:
 out:
 	if (ret)
 		put_futex_key(&q->key);
+#ifdef INSTRUMENT_FUTEX_WAIT
     m5_dump_stats(0, 0);
+#endif
 	return ret;
 }
 
@@ -3167,11 +3229,15 @@ static int futex_wait_gem5_instrumented(u32 __user *uaddr, unsigned int flags, u
 	if (!bitset)
 		return -EINVAL;
 	q.bitset = bitset;
+#ifdef INSTRUMENT_FUTEX_WAIT
     m5_dump_stats(0, 0);
+#endif
 
 	to = futex_setup_timer(abs_time, &timeout, flags,
 			       current->timer_slack_ns);
+#ifdef INSTRUMENT_FUTEX_WAIT
     m5_dump_stats(0, 0);
+#endif
 retry:
 	/*
 	 * Prepare to wait on uaddr. On success, holds hb lock and increments
