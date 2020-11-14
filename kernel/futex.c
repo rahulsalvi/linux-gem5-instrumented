@@ -3223,8 +3223,10 @@ static int futex_wait_gem5_instrumented(u32 __user *uaddr, unsigned int flags, u
 	struct futex_q q = futex_q_init;
 	int ret;
 
-    // reset stats at the beginning of the function call
-    m5_reset_stats(0, 0);
+#ifdef INSTRUMENT_FUTEX_WAIT
+    // dump stats at the beginning of the function call to measure time spent dispatching from userspace
+    m5_dump_stats(0, 0);
+#endif
 
 	if (!bitset)
 		return -EINVAL;
