@@ -63,7 +63,7 @@
 
 #include "locking/rtmutex_common.h"
 
-#define TEST_LOADED_HASH_QUEUE
+#define HASH_TO_SAME_BUCKET
 #define INSTRUMENT_FUTEX_WAIT
 /* #define INSTRUMENT_FUTEX_WAKE */
 
@@ -1869,7 +1869,7 @@ futex_wake_gem5_instrumented(u32 __user *uaddr, unsigned int flags, int nr_wake,
     m5_dump_stats(0, 0);
 #endif
 
-#ifdef TEST_LOADED_HASH_QUEUE
+#ifdef HASH_TO_SAME_BUCKET
 	hb = hash_futex_to_same_bucket(&key);
 #else
 	hb = hash_futex(&key);
@@ -2542,7 +2542,7 @@ static inline struct futex_hash_bucket *queue_lock_gem5_instrumented(struct fute
 #ifdef INSTRUMENT_FUTEX_WAIT
     m5_dump_stats(0, 0);
 #endif
-#ifdef TEST_LOADED_HASH_QUEUE
+#ifdef HASH_TO_SAME_BUCKET
 	hb = hash_futex_to_same_bucket(&q->key);
 #else
 	hb = hash_futex(&q->key);
