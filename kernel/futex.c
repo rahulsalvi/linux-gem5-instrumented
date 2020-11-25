@@ -727,7 +727,6 @@ get_futex_key_gem5_instrumented(u32 __user *uaddr, int fshared, union futex_key 
 	if (!fshared) {
 		key->private.mm = mm;
 		key->private.address = address;
-        m5_dump_stats(0, 0);
 		return 0;
 	}
 
@@ -1861,7 +1860,14 @@ futex_wake_gem5_instrumented(u32 __user *uaddr, unsigned int flags, int nr_wake,
     m5_dump_stats(0, 0);
 #endif
 
+#ifdef INSTRUMENT_FUTEX_WAKE
 	ret = get_futex_key_gem5_instrumented(uaddr, flags & FLAGS_SHARED, &key, FUTEX_READ);
+#else
+	ret = get_futex_key(uaddr, flags & FLAGS_SHARED, &key, FUTEX_READ);
+#endif
+#ifdef INSTRUMENT_FUTEX_WAKE
+    m5_dump_stats(0, 0);
+#endif
 	if (unlikely(ret != 0))
 		goto out;
 
@@ -3106,7 +3112,14 @@ static int futex_wait_setup_gem5_instrumented(u32 __user *uaddr, u32 val, unsign
 	 * while the syscall executes.
 	 */
 retry:
+#ifdef INSTRUMENT_FUTEX_WAIT
 	ret = get_futex_key_gem5_instrumented(uaddr, flags & FLAGS_SHARED, &q->key, FUTEX_READ);
+#else
+	ret = get_futex_key(uaddr, flags & FLAGS_SHARED, &q->key, FUTEX_READ);
+#endif
+#ifdef INSTRUMENT_FUTEX_WAIT
+    m5_dump_stats(0, 0);
+#endif
 	if (unlikely(ret != 0))
 		return ret;
 
