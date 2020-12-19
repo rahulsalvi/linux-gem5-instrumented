@@ -64,8 +64,8 @@
 #include "locking/rtmutex_common.h"
 
 #define HASH_TO_SAME_BUCKET
-#define INSTRUMENT_FUTEX_WAIT
-/* #define INSTRUMENT_FUTEX_WAKE */
+/* #define INSTRUMENT_FUTEX_WAIT */
+#define INSTRUMENT_FUTEX_WAKE
 
 /*
  * READ this before attempting to hack on futexes!
@@ -1850,7 +1850,7 @@ futex_wake_gem5_instrumented(u32 __user *uaddr, unsigned int flags, int nr_wake,
 	DEFINE_WAKE_Q(wake_q);
 
 #ifdef INSTRUMENT_FUTEX_WAKE
-    m5_reset_stats(0, 0);
+    m5_dump_stats(0, 0);
 #endif
 
 	if (!bitset)
@@ -3005,8 +3005,12 @@ static void futex_wait_queue_me_gem5_instrumented(struct futex_hash_bucket *hb, 
 		 * flagged for rescheduling. Only call schedule if there
 		 * is no timeout, or if it has yet to expire.
 		 */
+#ifdef INSTRUMENT_FUTEX_WAIT
+		if (!timeout || timeout->task) {}
+#else
 		if (!timeout || timeout->task)
 			freezable_schedule();
+#endif
 	}
 	__set_current_state(TASK_RUNNING);
 }
@@ -3267,6 +3271,10 @@ retry:
 
 	/* If we were woken (and unqueued), we succeeded, whatever. */
 	ret = 0;
+#ifdef INSTRUMENT_FUTEX_WAIT
+    unqueue_me(&q);
+    goto out;
+#endif
 	/* unqueue_me() drops q.key ref */
 	if (!unqueue_me(&q))
 		goto out;
@@ -3301,6 +3309,37 @@ out:
 		destroy_hrtimer_on_stack(&to->timer);
 	}
 	return ret;
+}
+
+static int futex_load_queue_gem5_instrumented(u32 __user *uaddr, unsigned int flags)
+{
+	struct futex_hash_bucket *hb;
+	struct futex_q *q;
+    u32 uval;
+    int ret;
+
+    q = kmalloc(sizeof(struct futex_q), GFP_KERNEL);
+    if (!q) {
+        return -3;
+    }
+    *q = futex_q_init;
+
+    ret = get_futex_key(uaddr, flags & FLAGS_SHARED, &q->key, FUTEX_READ);
+    if (ret != 0) {
+        return -1;
+    }
+    hb = hash_futex_to_same_bucket(&q->key);
+    hb_waiters_inc(hb);
+    q->lock_ptr = &hb->lock;
+    spin_lock(&hb->lock);
+
+	ret = get_futex_value_locked(&uval, uaddr);
+    if (ret != 0) {
+        return -2;
+    }
+    queue_me(q, hb);
+
+    return hb_waiters_pending(hb);
 }
 
 static long futex_wait_restart(struct restart_block *restart)
@@ -4358,6 +4397,8 @@ long do_futex(u32 __user *uaddr, int op, u32 val, ktime_t *timeout,
                              uaddr2);
         case FUTEX_CMP_REQUEUE_PI:
             return futex_requeue(uaddr, flags, uaddr2, val, val2, &val3, 1);
+        case FUTEX_LOAD_QUEUE:
+            return futex_load_queue_gem5_instrumented(uaddr, flags);
         }
         return -ENOSYS;
     }
